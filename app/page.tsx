@@ -84,6 +84,9 @@ export default function Home() {
   const [tabs, setTabs] = useState<SheetTab[]>([]);
   const [activeTab, setActiveTab] = useState<string | null>(null);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
+  const [aiOpen, setAiOpen] = useState(false);
+  const [aiPrompt, setAiPrompt] = useState("");
+  const [aiLoading, setAiLoading] = useState(false);
 
   const gridApiRef = useRef<GridApi | null>(null);
   const colCountRef = useRef(0); // 현재 데이터 열 개수(행번호 열 제외)
@@ -333,6 +336,40 @@ export default function Home() {
     void deleteDimension("COLUMNS", [letterToIndex(colId)]);
   }, [deleteDimension]);
 
+  // ---- AI 생성 ----
+  const refreshTabs = useCallback(async (id: string): Promise<SheetTab[]> => {
+    const res = await fetch(`/api/sheet/meta?spreadsheetId=${encodeURIComponent(id)}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "탭 목록을 불러오지 못했습니다.");
+    const visible: SheetTab[] = (data.sheets ?? []).filter((s: SheetTab) => !s.hidden);
+    setTabs(visible);
+    return visible;
+  }, []);
+
+  const generateWithAI = useCallback(async () => {
+    if (!loadedId || !aiPrompt.trim()) return;
+    setAiLoading(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/sheet/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ spreadsheetId: loadedId, prompt: aiPrompt }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "AI 생성에 실패했습니다.");
+      await refreshTabs(loadedId);
+      const created: string[] = data.createdTabs ?? [];
+      if (created.length > 0) await loadTab(loadedId, created[0]);
+      setAiOpen(false);
+      setAiPrompt("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "AI 생성 중 오류가 발생했습니다.");
+    } finally {
+      setAiLoading(false);
+    }
+  }, [loadedId, aiPrompt, refreshTabs, loadTab]);
+
   // ---- 시트 → 웹: 폴링 결과를 그리드에 반영 ----
   const applyRemoteValues = useCallback((values: string[][]) => {
     const api = gridApiRef.current;
@@ -503,6 +540,12 @@ export default function Home() {
               </div>
               <div className="flex shrink-0 gap-2">
                 <button
+                  onClick={() => setAiOpen((v) => !v)}
+                  className="rounded-lg bg-indigo-600 px-3 py-1.5 text-sm font-semibold text-white transition hover:bg-indigo-500"
+                >
+                  ✨ AI로 만들기
+                </button>
+                <button
                   onClick={addRow}
                   className="rounded-lg px-3 py-1.5 text-sm text-gray-700 ring-1 ring-gray-200 transition hover:bg-gray-50"
                 >
@@ -528,6 +571,47 @@ export default function Home() {
                 </button>
               </div>
             </div>
+
+            {aiOpen && (
+              <div className="mb-3 rounded-xl border border-indigo-100 bg-indigo-50/50 p-4">
+                <label className="mb-1.5 block text-xs font-medium text-indigo-900">
+                  무엇을 만들까요? (자연어로 입력하면 AI가 시트를 새 탭으로 만들어줘요)
+                </label>
+                <textarea
+                  value={aiPrompt}
+                  onChange={(e) => setAiPrompt(e.target.value)}
+                  rows={2}
+                  placeholder="예: 쇼핑몰 매출 관리 시스템 만들어줘"
+                  className="w-full resize-none rounded-lg border border-indigo-200 px-3 py-2 text-sm outline-none transition focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20"
+                />
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {["쇼핑몰 매출 관리 시스템", "가계부 (수입·지출·예산)", "재고 관리", "영업 CRM"].map(
+                    (ex) => (
+                      <button
+                        key={ex}
+                        onClick={() => setAiPrompt(ex)}
+                        className="rounded-full bg-white px-2.5 py-1 text-xs text-indigo-700 ring-1 ring-indigo-200 transition hover:bg-indigo-100"
+                      >
+                        {ex}
+                      </button>
+                    ),
+                  )}
+                </div>
+                <div className="mt-3 flex items-center gap-2">
+                  <button
+                    onClick={generateWithAI}
+                    disabled={aiLoading || !aiPrompt.trim()}
+                    className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-indigo-500 disabled:opacity-50"
+                  >
+                    {aiLoading ? "AI가 만들고 있어요…" : "생성"}
+                  </button>
+                  <span className="text-xs text-indigo-700/70">
+                    새 탭으로 추가됩니다. 수십 초 걸릴 수 있어요.
+                  </span>
+                </div>
+              </div>
+            )}
+
             <p className="mb-2 text-xs text-gray-400">
               셀을 더블클릭해 수정하면 자동 저장돼요. 헤더로 정렬·필터할 수 있고, 시트에서 바뀐 내용도 5초 안에 반영됩니다.
             </p>

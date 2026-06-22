@@ -9,6 +9,7 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.105.0",
     "ag-grid-community": "^35.3.1",
     "ag-grid-react": "^35.3.1",
     "googleapis": "^173.0.0",

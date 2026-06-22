@@ -7,11 +7,17 @@ import {
   AllCommunityModule,
   ModuleRegistry,
   type ColDef,
+  type GridApi,
+  type GridReadyEvent,
   type CellValueChangedEvent,
+  type CellEditingStartedEvent,
+  type CellEditingStoppedEvent,
 } from "ag-grid-community";
 
 // AG Grid v33+ 는 모듈 등록이 필요하다.
 ModuleRegistry.registerModules([AllCommunityModule]);
+
+const POLL_INTERVAL_MS = 5000;
 
 /** 0 → A, 1 → B, ... 26 → AA 형태의 스프레드시트 열 이름 */
 function columnLetter(index: number): string {
@@ -32,6 +38,26 @@ function extractSpreadsheetId(input: string): string {
   return match ? match[1] : trimmed;
 }
 
+/** 데이터 열 개수에 맞춰 컬럼 정의를 만든다 (맨 앞에 행번호 열). */
+function buildColumnDefs(maxCols: number): ColDef[] {
+  return [
+    {
+      headerName: "",
+      field: "__row",
+      width: 56,
+      pinned: "left",
+      sortable: false,
+      editable: false,
+      cellClass: "ag-row-number",
+    },
+    ...Array.from({ length: Math.max(maxCols, 1) }, (_, i) => ({
+      headerName: columnLetter(i),
+      field: columnLetter(i),
+      flex: 1,
+    })),
+  ];
+}
+
 type RowShape = Record<string, string | number>;
 type SaveStatus = "idle" | "saving" | "saved" | "error";
 
@@ -45,9 +71,14 @@ export default function Home() {
   const [loadedId, setLoadedId] = useState<string | null>(null);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
 
-  // 저장 대기열(셀 범위 → 값)과 디바운스 타이머
-  const pendingRef = useRef<Map<string, string>>(new Map());
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const gridApiRef = useRef<GridApi | null>(null);
+  const colCountRef = useRef(0); // 현재 데이터 열 개수(행번호 열 제외)
+
+  // dirty 보호용 자료구조
+  const pendingRef = useRef<Map<string, string>>(new Map()); // 저장 대기(아직 전송 안 함)
+  const lastWrittenRef = useRef<Map<string, string>>(new Map()); // 저장 완료, 폴링 확인 대기
+  const editingRef = useRef<Set<string>>(new Set()); // 현재 편집 중인 셀
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const defaultColDef = useMemo<ColDef>(
     () => ({ resizable: true, sortable: false, minWidth: 90, editable: true }),
@@ -61,6 +92,10 @@ export default function Home() {
     }
   }, [session?.error]);
 
+  const onGridReady = useCallback((e: GridReadyEvent) => {
+    gridApiRef.current = e.api;
+  }, []);
+
   const loadSheet = useCallback(async () => {
     setError(null);
     const id = extractSpreadsheetId(sheetInput);
@@ -70,31 +105,12 @@ export default function Home() {
     }
     setLoading(true);
     try {
-      const res = await fetch(
-        `/api/sheet?spreadsheetId=${encodeURIComponent(id)}`,
-      );
+      const res = await fetch(`/api/sheet?spreadsheetId=${encodeURIComponent(id)}`);
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "시트를 불러오지 못했습니다.");
 
       const values: string[][] = data.values ?? [];
       const maxCols = values.reduce((m, r) => Math.max(m, r.length), 0);
-
-      const cols: ColDef[] = [
-        {
-          headerName: "",
-          field: "__row",
-          width: 56,
-          pinned: "left",
-          sortable: false,
-          editable: false,
-          cellClass: "ag-row-number",
-        },
-        ...Array.from({ length: Math.max(maxCols, 1) }, (_, i) => ({
-          headerName: columnLetter(i),
-          field: columnLetter(i),
-          flex: 1,
-        })),
-      ];
 
       const rows: RowShape[] = values.map((r, ri) => {
         const obj: RowShape = { __row: ri + 1 };
@@ -102,7 +118,13 @@ export default function Home() {
         return obj;
       });
 
-      setColumnDefs(cols);
+      // 새 시트를 열면 이전 dirty 상태 초기화
+      pendingRef.current.clear();
+      lastWrittenRef.current.clear();
+      editingRef.current.clear();
+      colCountRef.current = maxCols;
+
+      setColumnDefs(buildColumnDefs(maxCols));
       setRowData(rows);
       setLoadedId(id);
       setSaveStatus("idle");
@@ -116,7 +138,7 @@ export default function Home() {
     }
   }, [sheetInput]);
 
-  // 대기열에 쌓인 변경분을 시트에 저장
+  // ---- 저장 (웹 → 시트) ----
   const flushSaves = useCallback(async () => {
     if (!loadedId) return;
     const entries = Array.from(pendingRef.current.entries());
@@ -135,6 +157,8 @@ export default function Home() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "저장에 실패했습니다.");
+      // 저장 성공 → 폴링이 이 값을 확인할 때까지 보호
+      for (const [range, value] of entries) lastWrittenRef.current.set(range, value);
       setSaveStatus("saved");
     } catch (e) {
       setSaveStatus("error");
@@ -142,7 +166,6 @@ export default function Home() {
     }
   }, [loadedId]);
 
-  // 셀 편집 → 낙관적 반영(그리드가 즉시 표시) + 디바운스 저장
   const onCellValueChanged = useCallback(
     (e: CellValueChangedEvent) => {
       const field = e.colDef.field;
@@ -152,13 +175,97 @@ export default function Home() {
       pendingRef.current.set(`${field}${row}`, value);
 
       setSaveStatus("saving");
-      if (timerRef.current) clearTimeout(timerRef.current);
-      timerRef.current = setTimeout(() => {
-        void flushSaves();
-      }, 700);
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = setTimeout(() => void flushSaves(), 700);
     },
     [flushSaves],
   );
+
+  const onCellEditingStarted = useCallback((e: CellEditingStartedEvent) => {
+    const field = e.colDef.field;
+    if (field && field !== "__row") {
+      editingRef.current.add(`${field}${(e.data as RowShape).__row}`);
+    }
+  }, []);
+
+  const onCellEditingStopped = useCallback((e: CellEditingStoppedEvent) => {
+    const field = e.colDef.field;
+    if (field && field !== "__row") {
+      editingRef.current.delete(`${field}${(e.data as RowShape).__row}`);
+    }
+  }, []);
+
+  // ---- 시트 → 웹: 폴링 결과를 그리드에 반영 ----
+  const applyRemoteValues = useCallback((values: string[][]) => {
+    const api = gridApiRef.current;
+    if (!api) return;
+
+    const maxCols = values.reduce((m, r) => Math.max(m, r.length), 0);
+    // 열이 늘어났으면 컬럼 정의 확장
+    if (maxCols > colCountRef.current) {
+      colCountRef.current = maxCols;
+      setColumnDefs(buildColumnDefs(maxCols));
+    }
+
+    const addRows: RowShape[] = [];
+    values.forEach((r, ri) => {
+      const sheetRow = ri + 1;
+      const node = api.getRowNode(String(sheetRow));
+
+      if (!node) {
+        const obj: RowShape = { __row: sheetRow };
+        for (let i = 0; i < maxCols; i++) obj[columnLetter(i)] = r[i] ?? "";
+        addRows.push(obj);
+        return;
+      }
+
+      for (let i = 0; i < maxCols; i++) {
+        const field = columnLetter(i);
+        const range = `${field}${sheetRow}`;
+        const incoming = r[i] ?? "";
+
+        // 사용자가 편집 중이거나 저장 대기 중인 셀은 건드리지 않는다.
+        if (pendingRef.current.has(range) || editingRef.current.has(range)) continue;
+
+        // 방금 우리가 쓴 값: 폴링에 반영됐으면 보호 해제, 아니면 stale 이므로 건너뜀
+        if (lastWrittenRef.current.has(range)) {
+          if (lastWrittenRef.current.get(range) === incoming) {
+            lastWrittenRef.current.delete(range);
+          } else {
+            continue;
+          }
+        }
+
+        const data = node.data as RowShape;
+        if (data[field] !== incoming) node.setDataValue(field, incoming);
+      }
+    });
+
+    if (addRows.length > 0) api.applyTransaction({ add: addRows });
+  }, []);
+
+  // 폴링 루프 (loadedId가 있을 때만, 백그라운드 탭이면 스킵)
+  const applyRef = useRef(applyRemoteValues);
+  useEffect(() => {
+    applyRef.current = applyRemoteValues;
+  }, [applyRemoteValues]);
+
+  useEffect(() => {
+    if (!loadedId) return;
+    const tick = async () => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      try {
+        const res = await fetch(`/api/sheet?spreadsheetId=${encodeURIComponent(loadedId)}`);
+        if (!res.ok) return; // 폴링 에러는 조용히 무시
+        const data = await res.json();
+        applyRef.current((data.values ?? []) as string[][]);
+      } catch {
+        /* 네트워크 일시 오류 무시 */
+      }
+    };
+    const id = setInterval(tick, POLL_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, [loadedId]);
 
   // ---- 세션 로딩 중 ----
   if (status === "loading") {
@@ -175,9 +282,7 @@ export default function Home() {
       <main className="flex flex-1 items-center justify-center px-4">
         <div className="w-full max-w-sm rounded-2xl bg-white p-8 text-center shadow-sm ring-1 ring-gray-100">
           <h1 className="text-2xl font-bold tracking-tight">Sheet Helper</h1>
-          <p className="mt-2 text-sm text-gray-500">
-            구글 시트를 웹에서 쉽고 간편하게.
-          </p>
+          <p className="mt-2 text-sm text-gray-500">구글 시트를 웹에서 쉽고 간편하게.</p>
           <button
             onClick={() => signIn("google")}
             className="mt-6 w-full rounded-xl bg-gray-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-gray-700"
@@ -192,11 +297,16 @@ export default function Home() {
   // ---- 로그인 후 화면 ----
   return (
     <div className="flex flex-1 flex-col">
-      {/* 상단 바 */}
       <header className="flex items-center justify-between border-b border-gray-200 bg-white px-6 py-3">
         <div className="flex items-center gap-3">
           <h1 className="text-lg font-bold tracking-tight">Sheet Helper</h1>
           <SaveBadge status={saveStatus} />
+          {loadedId && (
+            <span className="flex items-center gap-1.5 text-xs text-gray-400">
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-green-500" />
+              실시간 동기화 중
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-3 text-sm">
           <span className="text-gray-500">{session.user?.email}</span>
@@ -209,7 +319,6 @@ export default function Home() {
         </div>
       </header>
 
-      {/* 시트 불러오기 입력 */}
       <section className="border-b border-gray-200 bg-white px-6 py-4">
         <label className="mb-1.5 block text-xs font-medium text-gray-500">
           구글 시트 링크 또는 ID
@@ -233,19 +342,22 @@ export default function Home() {
         {error && <p className="mt-2 text-sm text-red-600">{error}</p>}
       </section>
 
-      {/* 그리드 */}
       <main className="flex-1 p-6">
         {loadedId ? (
           <>
             <p className="mb-2 text-xs text-gray-400">
-              셀을 더블클릭해 수정하면 구글 시트에 자동 저장돼요.
+              셀을 더블클릭해 수정하면 구글 시트에 자동 저장돼요. 시트에서 바뀐 내용도 5초 안에 여기 반영됩니다.
             </p>
             <div className="h-[calc(100vh-250px)] w-full overflow-hidden rounded-xl ring-1 ring-gray-200">
               <AgGridReact
                 rowData={rowData}
                 columnDefs={columnDefs}
                 defaultColDef={defaultColDef}
+                getRowId={(p) => String((p.data as RowShape).__row)}
+                onGridReady={onGridReady}
                 onCellValueChanged={onCellValueChanged}
+                onCellEditingStarted={onCellEditingStarted}
+                onCellEditingStopped={onCellEditingStopped}
                 stopEditingWhenCellsLoseFocus
               />
             </div>
@@ -256,9 +368,7 @@ export default function Home() {
               <p className="text-sm">
                 위에 구글 시트 링크를 붙여넣고 <b>불러오기</b>를 눌러보세요.
               </p>
-              <p className="mt-1 text-xs">
-                본인 계정으로 접근 가능한 시트만 열 수 있어요.
-              </p>
+              <p className="mt-1 text-xs">본인 계정으로 접근 가능한 시트만 열 수 있어요.</p>
             </div>
           </div>
         )}

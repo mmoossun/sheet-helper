@@ -73,6 +73,24 @@ type RowShape = Record<string, string | number>;
 type SaveStatus = "idle" | "saving" | "saved" | "error";
 type SheetTab = { sheetId: number; title: string; index: number; hidden: boolean };
 
+// Level 1 함수 블록 — 클릭하면 포커스한 셀에 수식을 자동으로 넣어준다.
+type FormulaBlock = {
+  key: string;
+  label: string;
+  desc: string;
+  make: (col: string, row: number) => string;
+};
+const FORMULA_BLOCKS: FormulaBlock[] = [
+  { key: "SUM", label: "합계", desc: "위 칸들을 모두 더해요", make: (c, r) => `=SUM(${c}1:${c}${Math.max(r - 1, 1)})` },
+  { key: "AVERAGE", label: "평균", desc: "위 칸들의 평균", make: (c, r) => `=AVERAGE(${c}1:${c}${Math.max(r - 1, 1)})` },
+  { key: "COUNT", label: "개수", desc: "값이 있는 칸의 개수", make: (c, r) => `=COUNTA(${c}1:${c}${Math.max(r - 1, 1)})` },
+  { key: "MAX", label: "최댓값", desc: "가장 큰 값", make: (c, r) => `=MAX(${c}1:${c}${Math.max(r - 1, 1)})` },
+  { key: "MIN", label: "최솟값", desc: "가장 작은 값", make: (c, r) => `=MIN(${c}1:${c}${Math.max(r - 1, 1)})` },
+  { key: "TODAY", label: "오늘 날짜", desc: "오늘 날짜를 자동으로", make: () => `=TODAY()` },
+  { key: "IF", label: "조건(IF)", desc: "조건에 따라 다른 값", make: (c, r) => `=IF(${c}${Math.max(r - 1, 1)}>0, "양수", "음수")` },
+  { key: "VLOOKUP", label: "찾기(VLOOKUP)", desc: "다른 표에서 값 찾기", make: () => `=VLOOKUP("찾을값", A:B, 2, FALSE)` },
+];
+
 export default function Home() {
   const { data: session, status } = useSession();
   const [sheetInput, setSheetInput] = useState("");
@@ -87,6 +105,7 @@ export default function Home() {
   const [aiOpen, setAiOpen] = useState(false);
   const [aiPrompt, setAiPrompt] = useState("");
   const [aiLoading, setAiLoading] = useState(false);
+  const [blockOpen, setBlockOpen] = useState(false);
 
   const gridApiRef = useRef<GridApi | null>(null);
   const colCountRef = useRef(0); // 현재 데이터 열 개수(행번호 열 제외)
@@ -205,14 +224,21 @@ export default function Home() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "저장에 실패했습니다.");
-      // 저장 성공 → 폴링이 이 값을 확인할 때까지 보호
-      for (const [range, value] of entries) lastWrittenRef.current.set(range, value);
+      // 수식(=...)이 포함됐으면: 쓴 값(수식) ≠ 읽는 값(계산결과)이라 보호 로직이
+      // 막아버리므로, 탭을 다시 읽어 계산 결과로 반영한다.
+      const hasFormula = entries.some(([, v]) => v.trimStart().startsWith("="));
+      if (hasFormula) {
+        await loadTab(loadedId, activeTab);
+      } else {
+        // 일반 값 → 폴링이 이 값을 확인할 때까지 보호
+        for (const [range, value] of entries) lastWrittenRef.current.set(range, value);
+      }
       setSaveStatus("saved");
     } catch (e) {
       setSaveStatus("error");
       setError(e instanceof Error ? e.message : "저장 중 오류가 발생했습니다.");
     }
-  }, [loadedId, activeTab]);
+  }, [loadedId, activeTab, loadTab]);
 
   const onCellValueChanged = useCallback(
     (e: CellValueChangedEvent) => {
@@ -369,6 +395,38 @@ export default function Home() {
       setAiLoading(false);
     }
   }, [loadedId, aiPrompt, refreshTabs, loadTab]);
+
+  // ---- 함수 블록: 포커스한 셀에 수식 삽입 ----
+  const insertBlock = useCallback(
+    (make: (col: string, row: number) => string) => {
+      const api = gridApiRef.current;
+      if (!api) return;
+      const cell = api.getFocusedCell();
+      if (!cell) {
+        setError("먼저 수식을 넣을 셀을 클릭하세요.");
+        return;
+      }
+      const colId = cell.column.getColId();
+      if (!/^[A-Z]+$/.test(colId)) {
+        setError("수식을 넣을 데이터 셀을 클릭하세요.");
+        return;
+      }
+      const node = api.getDisplayedRowAtIndex(cell.rowIndex);
+      if (!node) return;
+      const sheetRow = (node.data as RowShape).__row as number;
+      const formula = make(colId, sheetRow);
+      const range = `${colId}${sheetRow}`;
+
+      node.setDataValue(colId, formula); // 낙관적 표시(잠깐 수식 텍스트)
+      pendingRef.current.set(range, formula);
+      setError(null);
+      setSaveStatus("saving");
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+      // 저장 후 flushSaves가 계산 결과로 다시 읽어온다(수식 경로).
+      saveTimerRef.current = setTimeout(() => void flushSaves(), 300);
+    },
+    [flushSaves],
+  );
 
   // ---- 시트 → 웹: 폴링 결과를 그리드에 반영 ----
   const applyRemoteValues = useCallback((values: string[][]) => {
@@ -546,6 +604,12 @@ export default function Home() {
                   ✨ AI로 만들기
                 </button>
                 <button
+                  onClick={() => setBlockOpen((v) => !v)}
+                  className="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-semibold text-white transition hover:bg-emerald-500"
+                >
+                  🧱 함수 블록
+                </button>
+                <button
                   onClick={addRow}
                   className="rounded-lg px-3 py-1.5 text-sm text-gray-700 ring-1 ring-gray-200 transition hover:bg-gray-50"
                 >
@@ -571,6 +635,26 @@ export default function Home() {
                 </button>
               </div>
             </div>
+
+            {blockOpen && (
+              <div className="mb-3 rounded-xl border border-emerald-100 bg-emerald-50/50 p-4">
+                <p className="mb-2 text-xs font-medium text-emerald-900">
+                  넣을 셀을 클릭한 뒤 블록을 누르면, 함수를 몰라도 수식이 자동으로 들어가요.
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {FORMULA_BLOCKS.map((b) => (
+                    <button
+                      key={b.key}
+                      onClick={() => insertBlock(b.make)}
+                      title={b.desc}
+                      className="rounded-lg bg-white px-3 py-1.5 text-sm text-emerald-800 ring-1 ring-emerald-200 transition hover:bg-emerald-100"
+                    >
+                      {b.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {aiOpen && (
               <div className="mb-3 rounded-xl border border-indigo-100 bg-indigo-50/50 p-4">

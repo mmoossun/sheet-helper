@@ -74,8 +74,13 @@ function extractSpreadsheetId(input: string): string {
   return match ? match[1] : trimmed;
 }
 
-/** 데이터 열 개수에 맞춰 컬럼 정의를 만든다 (맨 앞에 행번호 열). */
-function buildColumnDefs(maxCols: number): ColDef[] {
+type ColValidation = { type: "list" | "checkbox"; values?: string[] };
+
+/** 데이터 열 개수에 맞춰 컬럼 정의를 만든다 (맨 앞에 행번호 열). 검증 있는 열은 드롭다운 편집기. */
+function buildColumnDefs(
+  maxCols: number,
+  validations: Record<string, ColValidation> = {},
+): ColDef[] {
   return [
     {
       headerName: "",
@@ -87,11 +92,18 @@ function buildColumnDefs(maxCols: number): ColDef[] {
       editable: false,
       cellClass: "ag-row-number",
     },
-    ...Array.from({ length: Math.max(maxCols, 1) }, (_, i) => ({
-      headerName: columnLetter(i),
-      field: columnLetter(i),
-      flex: 1,
-    })),
+    ...Array.from({ length: Math.max(maxCols, 1) }, (_, i) => {
+      const field = columnLetter(i);
+      const v = validations[field];
+      const def: ColDef = { headerName: field, field, flex: 1 };
+      if (v) {
+        const list = v.type === "checkbox" ? ["TRUE", "FALSE"] : v.values ?? [];
+        def.cellEditor = "agSelectCellEditor";
+        def.cellEditorParams = { values: list };
+        def.headerName = `${field} ▾`;
+      }
+      return def;
+    }),
   ];
 }
 
@@ -133,9 +145,12 @@ export default function Home() {
   const [aiLoading, setAiLoading] = useState(false);
   const [blockOpen, setBlockOpen] = useState(false);
   const [chartOpen, setChartOpen] = useState(false);
+  const [ruleOpen, setRuleOpen] = useState(false);
+  const [dropdownOptions, setDropdownOptions] = useState("");
 
   const gridApiRef = useRef<GridApi | null>(null);
   const colCountRef = useRef(0); // 현재 데이터 열 개수(행번호 열 제외)
+  const validationsRef = useRef<Record<string, ColValidation>>({}); // 열별 입력 규칙
 
   // dirty 보호용 자료구조
   const pendingRef = useRef<Map<string, string>>(new Map()); // 저장 대기(아직 전송 안 함)
@@ -170,7 +185,7 @@ export default function Home() {
     setError(null);
     try {
       const res = await fetch(
-        `/api/sheet?spreadsheetId=${encodeURIComponent(id)}&sheet=${encodeURIComponent(title)}`,
+        `/api/sheet?spreadsheetId=${encodeURIComponent(id)}&sheet=${encodeURIComponent(title)}&validations=1`,
       );
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "시트를 불러오지 못했습니다.");
@@ -188,8 +203,9 @@ export default function Home() {
       lastWrittenRef.current.clear();
       editingRef.current.clear();
       colCountRef.current = maxCols;
+      validationsRef.current = data.validations ?? {};
 
-      setColumnDefs(buildColumnDefs(maxCols));
+      setColumnDefs(buildColumnDefs(maxCols, validationsRef.current));
       setRowData(rows);
       setActiveTab(title);
       setSaveStatus("idle");
@@ -325,7 +341,7 @@ export default function Home() {
 
   const addColumn = useCallback(() => {
     colCountRef.current += 1;
-    setColumnDefs(buildColumnDefs(colCountRef.current));
+    setColumnDefs(buildColumnDefs(colCountRef.current, validationsRef.current));
   }, []);
 
   // 공통: 행/열 삭제 요청 후 해당 탭을 다시 로드(번호가 밀리므로 재동기화)
@@ -455,6 +471,49 @@ export default function Home() {
     [flushSaves],
   );
 
+  // ---- 입력 규칙(드롭다운/체크박스): 포커스 셀의 열에 적용 ----
+  const applyValidation = useCallback(
+    async (type: "list" | "checkbox" | "clear", values?: string[]) => {
+      const api = gridApiRef.current;
+      if (!api || !loadedId || !activeTab) return;
+      const cell = api.getFocusedCell();
+      if (!cell) {
+        setError("규칙을 적용할 열의 셀을 먼저 클릭하세요.");
+        return;
+      }
+      const colId = cell.column.getColId();
+      if (!/^[A-Z]+$/.test(colId)) {
+        setError("데이터 열의 셀을 클릭하세요.");
+        return;
+      }
+      const tab = tabs.find((t) => t.title === activeTab);
+      if (!tab) return;
+      setError(null);
+      setSaveStatus("saving");
+      try {
+        const res = await fetch("/api/sheet/validation", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            spreadsheetId: loadedId,
+            sheetId: tab.sheetId,
+            columnIndex: letterToIndex(colId),
+            type,
+            values,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "규칙 적용에 실패했습니다.");
+        await loadTab(loadedId, activeTab); // 규칙을 다시 읽어 그리드에 반영
+        setSaveStatus("saved");
+      } catch (e) {
+        setSaveStatus("error");
+        setError(e instanceof Error ? e.message : "규칙 적용 중 오류가 발생했습니다.");
+      }
+    },
+    [loadedId, activeTab, tabs, loadTab],
+  );
+
   // ---- 시트 → 웹: 폴링 결과를 그리드에 반영 ----
   const applyRemoteValues = useCallback((values: string[][]) => {
     const api = gridApiRef.current;
@@ -463,7 +522,7 @@ export default function Home() {
     const maxCols = values.reduce((m, r) => Math.max(m, r.length), 0);
     if (maxCols > colCountRef.current) {
       colCountRef.current = maxCols;
-      setColumnDefs(buildColumnDefs(maxCols));
+      setColumnDefs(buildColumnDefs(maxCols, validationsRef.current));
     }
 
     const addRows: RowShape[] = [];
@@ -643,6 +702,12 @@ export default function Home() {
                   📊 차트
                 </button>
                 <button
+                  onClick={() => setRuleOpen((v) => !v)}
+                  className="rounded-lg bg-amber-500 px-3 py-1.5 text-sm font-semibold text-white transition hover:bg-amber-400"
+                >
+                  ✓ 입력 규칙
+                </button>
+                <button
                   onClick={addRow}
                   className="rounded-lg px-3 py-1.5 text-sm text-gray-700 ring-1 ring-gray-200 transition hover:bg-gray-50"
                 >
@@ -725,6 +790,50 @@ export default function Home() {
                   <span className="text-xs text-indigo-700/70">
                     새 탭으로 추가됩니다. 수십 초 걸릴 수 있어요.
                   </span>
+                </div>
+              </div>
+            )}
+
+            {ruleOpen && (
+              <div className="mb-3 rounded-xl border border-amber-100 bg-amber-50/50 p-4">
+                <p className="mb-2 text-xs font-medium text-amber-900">
+                  규칙을 적용할 열의 셀을 클릭한 뒤 선택하세요. 구글 시트에도 그대로 적용돼요.
+                </p>
+                <div className="flex flex-wrap items-center gap-2">
+                  <input
+                    value={dropdownOptions}
+                    onChange={(e) => setDropdownOptions(e.target.value)}
+                    placeholder="드롭다운 항목: 예) 진행중, 완료, 보류"
+                    className="min-w-[200px] flex-1 rounded-lg border border-amber-200 px-3 py-1.5 text-sm outline-none transition focus:border-amber-500"
+                  />
+                  <button
+                    onClick={() => {
+                      const vals = dropdownOptions
+                        .split(",")
+                        .map((s) => s.trim())
+                        .filter(Boolean);
+                      if (vals.length === 0) {
+                        setError("드롭다운 항목을 콤마(,)로 구분해 입력하세요.");
+                        return;
+                      }
+                      void applyValidation("list", vals);
+                    }}
+                    className="rounded-lg bg-amber-500 px-3 py-1.5 text-sm font-semibold text-white transition hover:bg-amber-400"
+                  >
+                    드롭다운 적용
+                  </button>
+                  <button
+                    onClick={() => void applyValidation("checkbox")}
+                    className="rounded-lg px-3 py-1.5 text-sm text-amber-800 ring-1 ring-amber-200 transition hover:bg-amber-100"
+                  >
+                    체크박스
+                  </button>
+                  <button
+                    onClick={() => void applyValidation("clear")}
+                    className="rounded-lg px-3 py-1.5 text-sm text-gray-600 ring-1 ring-gray-200 transition hover:bg-gray-50"
+                  >
+                    규칙 해제
+                  </button>
                 </div>
               </div>
             )}

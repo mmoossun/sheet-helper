@@ -12,6 +12,7 @@ import {
   type CellValueChangedEvent,
   type CellEditingStartedEvent,
   type CellEditingStoppedEvent,
+  type RowSelectionOptions,
 } from "ag-grid-community";
 
 // AG Grid v33+ 는 모듈 등록이 필요하다.
@@ -29,6 +30,15 @@ function columnLetter(index: number): string {
     i = Math.floor((i - 1) / 26);
   }
   return s;
+}
+
+/** "A" → 0, "B" → 1, ... "AA" → 26. columnLetter 의 역함수. */
+function letterToIndex(letter: string): number {
+  let n = 0;
+  for (let k = 0; k < letter.length; k++) {
+    n = n * 26 + (letter.charCodeAt(k) - 64);
+  }
+  return n - 1;
 }
 
 /** 전체 URL을 붙여넣어도 시트 ID만 뽑아낸다. */
@@ -86,6 +96,12 @@ export default function Home() {
 
   const defaultColDef = useMemo<ColDef>(
     () => ({ resizable: true, sortable: true, filter: true, minWidth: 90, editable: true }),
+    [],
+  );
+
+  // 행 선택(체크박스, 다중) — 행 삭제에 사용
+  const rowSelection = useMemo<RowSelectionOptions>(
+    () => ({ mode: "multiRow", enableClickSelection: false }),
     [],
   );
 
@@ -255,6 +271,67 @@ export default function Home() {
     colCountRef.current += 1;
     setColumnDefs(buildColumnDefs(colCountRef.current));
   }, []);
+
+  // 공통: 행/열 삭제 요청 후 해당 탭을 다시 로드(번호가 밀리므로 재동기화)
+  const deleteDimension = useCallback(
+    async (dimension: "ROWS" | "COLUMNS", indices: number[]) => {
+      if (!loadedId || !activeTab) return;
+      const tab = tabs.find((t) => t.title === activeTab);
+      if (!tab) return;
+
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+      await flushSaves();
+      setSaveStatus("saving");
+      try {
+        const res = await fetch("/api/sheet/dimension", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            spreadsheetId: loadedId,
+            sheetId: tab.sheetId,
+            dimension,
+            indices,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "삭제에 실패했습니다.");
+        await loadTab(loadedId, activeTab);
+        setSaveStatus("saved");
+      } catch (e) {
+        setSaveStatus("error");
+        setError(e instanceof Error ? e.message : "삭제 중 오류가 발생했습니다.");
+      }
+    },
+    [loadedId, activeTab, tabs, flushSaves, loadTab],
+  );
+
+  const deleteRows = useCallback(() => {
+    const api = gridApiRef.current;
+    if (!api) return;
+    const nodes = api.getSelectedNodes();
+    if (nodes.length === 0) {
+      setError("삭제할 행의 왼쪽 체크박스를 먼저 선택해 주세요.");
+      return;
+    }
+    const indices = nodes.map((n) => ((n.data as RowShape).__row as number) - 1);
+    void deleteDimension("ROWS", indices);
+  }, [deleteDimension]);
+
+  const deleteColumn = useCallback(() => {
+    const api = gridApiRef.current;
+    if (!api) return;
+    const cell = api.getFocusedCell();
+    if (!cell) {
+      setError("삭제할 열의 셀을 먼저 클릭해 주세요.");
+      return;
+    }
+    const colId = cell.column.getColId();
+    if (!/^[A-Z]+$/.test(colId)) {
+      setError("삭제할 열의 데이터 셀을 클릭해 주세요.");
+      return;
+    }
+    void deleteDimension("COLUMNS", [letterToIndex(colId)]);
+  }, [deleteDimension]);
 
   // ---- 시트 → 웹: 폴링 결과를 그리드에 반영 ----
   const applyRemoteValues = useCallback((values: string[][]) => {
@@ -437,6 +514,18 @@ export default function Home() {
                 >
                   + 열
                 </button>
+                <button
+                  onClick={deleteRows}
+                  className="rounded-lg px-3 py-1.5 text-sm text-red-600 ring-1 ring-red-200 transition hover:bg-red-50"
+                >
+                  행 삭제
+                </button>
+                <button
+                  onClick={deleteColumn}
+                  className="rounded-lg px-3 py-1.5 text-sm text-red-600 ring-1 ring-red-200 transition hover:bg-red-50"
+                >
+                  열 삭제
+                </button>
               </div>
             </div>
             <p className="mb-2 text-xs text-gray-400">
@@ -447,6 +536,7 @@ export default function Home() {
                 rowData={rowData}
                 columnDefs={columnDefs}
                 defaultColDef={defaultColDef}
+                rowSelection={rowSelection}
                 getRowId={(p) => String((p.data as RowShape).__row)}
                 onGridReady={onGridReady}
                 onCellValueChanged={onCellValueChanged}

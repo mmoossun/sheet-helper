@@ -47,6 +47,7 @@ function buildColumnDefs(maxCols: number): ColDef[] {
       width: 56,
       pinned: "left",
       sortable: false,
+      filter: false,
       editable: false,
       cellClass: "ag-row-number",
     },
@@ -60,6 +61,7 @@ function buildColumnDefs(maxCols: number): ColDef[] {
 
 type RowShape = Record<string, string | number>;
 type SaveStatus = "idle" | "saving" | "saved" | "error";
+type SheetTab = { sheetId: number; title: string; index: number; hidden: boolean };
 
 export default function Home() {
   const { data: session, status } = useSession();
@@ -69,6 +71,8 @@ export default function Home() {
   const [rowData, setRowData] = useState<RowShape[]>([]);
   const [columnDefs, setColumnDefs] = useState<ColDef[]>([]);
   const [loadedId, setLoadedId] = useState<string | null>(null);
+  const [tabs, setTabs] = useState<SheetTab[]>([]);
+  const [activeTab, setActiveTab] = useState<string | null>(null);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
 
   const gridApiRef = useRef<GridApi | null>(null);
@@ -81,7 +85,7 @@ export default function Home() {
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const defaultColDef = useMemo<ColDef>(
-    () => ({ resizable: true, sortable: false, minWidth: 90, editable: true }),
+    () => ({ resizable: true, sortable: true, filter: true, minWidth: 90, editable: true }),
     [],
   );
 
@@ -96,6 +100,40 @@ export default function Home() {
     gridApiRef.current = e.api;
   }, []);
 
+  // 특정 탭의 값을 읽어 그리드에 채운다.
+  const loadTab = useCallback(async (id: string, title: string) => {
+    setError(null);
+    try {
+      const res = await fetch(
+        `/api/sheet?spreadsheetId=${encodeURIComponent(id)}&sheet=${encodeURIComponent(title)}`,
+      );
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "시트를 불러오지 못했습니다.");
+
+      const values: string[][] = data.values ?? [];
+      const maxCols = values.reduce((m, r) => Math.max(m, r.length), 0);
+      const rows: RowShape[] = values.map((r, ri) => {
+        const obj: RowShape = { __row: ri + 1 };
+        for (let i = 0; i < maxCols; i++) obj[columnLetter(i)] = r[i] ?? "";
+        return obj;
+      });
+
+      // 탭을 바꾸면 이전 탭의 dirty 상태 초기화
+      pendingRef.current.clear();
+      lastWrittenRef.current.clear();
+      editingRef.current.clear();
+      colCountRef.current = maxCols;
+
+      setColumnDefs(buildColumnDefs(maxCols));
+      setRowData(rows);
+      setActiveTab(title);
+      setSaveStatus("idle");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "알 수 없는 오류가 발생했습니다.");
+    }
+  }, []);
+
+  // 시트 링크 입력 → 탭 목록 조회 후 첫 탭 로드
   const loadSheet = useCallback(async () => {
     setError(null);
     const id = extractSpreadsheetId(sheetInput);
@@ -105,42 +143,32 @@ export default function Home() {
     }
     setLoading(true);
     try {
-      const res = await fetch(`/api/sheet?spreadsheetId=${encodeURIComponent(id)}`);
+      const res = await fetch(`/api/sheet/meta?spreadsheetId=${encodeURIComponent(id)}`);
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "시트를 불러오지 못했습니다.");
+      if (!res.ok) throw new Error(data.error || "시트 정보를 불러오지 못했습니다.");
 
-      const values: string[][] = data.values ?? [];
-      const maxCols = values.reduce((m, r) => Math.max(m, r.length), 0);
+      const all: SheetTab[] = data.sheets ?? [];
+      const visible = all.filter((s) => !s.hidden);
+      if (visible.length === 0) throw new Error("열 수 있는 시트 탭이 없습니다.");
 
-      const rows: RowShape[] = values.map((r, ri) => {
-        const obj: RowShape = { __row: ri + 1 };
-        for (let i = 0; i < maxCols; i++) obj[columnLetter(i)] = r[i] ?? "";
-        return obj;
-      });
-
-      // 새 시트를 열면 이전 dirty 상태 초기화
-      pendingRef.current.clear();
-      lastWrittenRef.current.clear();
-      editingRef.current.clear();
-      colCountRef.current = maxCols;
-
-      setColumnDefs(buildColumnDefs(maxCols));
-      setRowData(rows);
+      setTabs(visible);
       setLoadedId(id);
-      setSaveStatus("idle");
+      await loadTab(id, visible[0].title);
     } catch (e) {
       setError(e instanceof Error ? e.message : "알 수 없는 오류가 발생했습니다.");
+      setLoadedId(null);
+      setTabs([]);
+      setActiveTab(null);
       setRowData([]);
       setColumnDefs([]);
-      setLoadedId(null);
     } finally {
       setLoading(false);
     }
-  }, [sheetInput]);
+  }, [sheetInput, loadTab]);
 
   // ---- 저장 (웹 → 시트) ----
   const flushSaves = useCallback(async () => {
-    if (!loadedId) return;
+    if (!loadedId || !activeTab) return;
     const entries = Array.from(pendingRef.current.entries());
     if (entries.length === 0) return;
     pendingRef.current.clear();
@@ -152,6 +180,7 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           spreadsheetId: loadedId,
+          sheet: activeTab,
           updates: entries.map(([range, value]) => ({ range, value })),
         }),
       });
@@ -164,7 +193,7 @@ export default function Home() {
       setSaveStatus("error");
       setError(e instanceof Error ? e.message : "저장 중 오류가 발생했습니다.");
     }
-  }, [loadedId]);
+  }, [loadedId, activeTab]);
 
   const onCellValueChanged = useCallback(
     (e: CellValueChangedEvent) => {
@@ -195,13 +224,44 @@ export default function Home() {
     }
   }, []);
 
+  // 탭 전환: 떠나는 탭의 미저장분을 먼저 저장하고 새 탭 로드
+  const switchTab = useCallback(
+    async (title: string) => {
+      if (!loadedId || title === activeTab) return;
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+      setLoading(true);
+      await flushSaves();
+      await loadTab(loadedId, title);
+      setLoading(false);
+    },
+    [loadedId, activeTab, flushSaves, loadTab],
+  );
+
+  // ---- 행/열 추가 (값 입력 시 시트에 생성됨) ----
+  const addRow = useCallback(() => {
+    const api = gridApiRef.current;
+    if (!api) return;
+    let maxRow = 0;
+    api.forEachNode((n) => {
+      const v = (n.data as RowShape).__row as number;
+      if (v > maxRow) maxRow = v;
+    });
+    const obj: RowShape = { __row: maxRow + 1 };
+    for (let i = 0; i < colCountRef.current; i++) obj[columnLetter(i)] = "";
+    api.applyTransaction({ add: [obj] });
+  }, []);
+
+  const addColumn = useCallback(() => {
+    colCountRef.current += 1;
+    setColumnDefs(buildColumnDefs(colCountRef.current));
+  }, []);
+
   // ---- 시트 → 웹: 폴링 결과를 그리드에 반영 ----
   const applyRemoteValues = useCallback((values: string[][]) => {
     const api = gridApiRef.current;
     if (!api) return;
 
     const maxCols = values.reduce((m, r) => Math.max(m, r.length), 0);
-    // 열이 늘어났으면 컬럼 정의 확장
     if (maxCols > colCountRef.current) {
       colCountRef.current = maxCols;
       setColumnDefs(buildColumnDefs(maxCols));
@@ -244,19 +304,21 @@ export default function Home() {
     if (addRows.length > 0) api.applyTransaction({ add: addRows });
   }, []);
 
-  // 폴링 루프 (loadedId가 있을 때만, 백그라운드 탭이면 스킵)
+  // 폴링 루프 (활성 탭 기준, 백그라운드 탭이면 스킵)
   const applyRef = useRef(applyRemoteValues);
   useEffect(() => {
     applyRef.current = applyRemoteValues;
   }, [applyRemoteValues]);
 
   useEffect(() => {
-    if (!loadedId) return;
+    if (!loadedId || !activeTab) return;
     const tick = async () => {
       if (typeof document !== "undefined" && document.hidden) return;
       try {
-        const res = await fetch(`/api/sheet?spreadsheetId=${encodeURIComponent(loadedId)}`);
-        if (!res.ok) return; // 폴링 에러는 조용히 무시
+        const res = await fetch(
+          `/api/sheet?spreadsheetId=${encodeURIComponent(loadedId)}&sheet=${encodeURIComponent(activeTab)}`,
+        );
+        if (!res.ok) return;
         const data = await res.json();
         applyRef.current((data.values ?? []) as string[][]);
       } catch {
@@ -265,7 +327,7 @@ export default function Home() {
     };
     const id = setInterval(tick, POLL_INTERVAL_MS);
     return () => clearInterval(id);
-  }, [loadedId]);
+  }, [loadedId, activeTab]);
 
   // ---- 세션 로딩 중 ----
   if (status === "loading") {
@@ -342,13 +404,45 @@ export default function Home() {
         {error && <p className="mt-2 text-sm text-red-600">{error}</p>}
       </section>
 
-      <main className="flex-1 p-6">
+      <main className="flex flex-1 flex-col p-6">
         {loadedId ? (
           <>
+            {/* 탭 바 + 도구 */}
+            <div className="mb-2 flex items-end justify-between gap-3">
+              <div className="flex gap-1 overflow-x-auto">
+                {tabs.map((t) => (
+                  <button
+                    key={t.sheetId}
+                    onClick={() => switchTab(t.title)}
+                    className={`whitespace-nowrap rounded-t-lg px-3 py-1.5 text-sm transition ${
+                      activeTab === t.title
+                        ? "bg-white font-semibold text-gray-900 ring-1 ring-gray-200"
+                        : "text-gray-500 hover:bg-gray-100"
+                    }`}
+                  >
+                    {t.title}
+                  </button>
+                ))}
+              </div>
+              <div className="flex shrink-0 gap-2">
+                <button
+                  onClick={addRow}
+                  className="rounded-lg px-3 py-1.5 text-sm text-gray-700 ring-1 ring-gray-200 transition hover:bg-gray-50"
+                >
+                  + 행
+                </button>
+                <button
+                  onClick={addColumn}
+                  className="rounded-lg px-3 py-1.5 text-sm text-gray-700 ring-1 ring-gray-200 transition hover:bg-gray-50"
+                >
+                  + 열
+                </button>
+              </div>
+            </div>
             <p className="mb-2 text-xs text-gray-400">
-              셀을 더블클릭해 수정하면 구글 시트에 자동 저장돼요. 시트에서 바뀐 내용도 5초 안에 여기 반영됩니다.
+              셀을 더블클릭해 수정하면 자동 저장돼요. 헤더로 정렬·필터할 수 있고, 시트에서 바뀐 내용도 5초 안에 반영됩니다.
             </p>
-            <div className="h-[calc(100vh-250px)] w-full overflow-hidden rounded-xl ring-1 ring-gray-200">
+            <div className="flex-1 overflow-hidden rounded-xl ring-1 ring-gray-200">
               <AgGridReact
                 rowData={rowData}
                 columnDefs={columnDefs}
@@ -363,7 +457,7 @@ export default function Home() {
             </div>
           </>
         ) : (
-          <div className="flex h-full items-center justify-center text-center text-gray-400">
+          <div className="flex flex-1 items-center justify-center text-center text-gray-400">
             <div>
               <p className="text-sm">
                 위에 구글 시트 링크를 붙여넣고 <b>불러오기</b>를 눌러보세요.

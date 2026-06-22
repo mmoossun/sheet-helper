@@ -1,12 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSession, signIn, signOut } from "next-auth/react";
 import { AgGridReact } from "ag-grid-react";
 import {
   AllCommunityModule,
   ModuleRegistry,
   type ColDef,
+  type CellValueChangedEvent,
 } from "ag-grid-community";
 
 // AG Grid v33+ 는 모듈 등록이 필요하다.
@@ -32,6 +33,7 @@ function extractSpreadsheetId(input: string): string {
 }
 
 type RowShape = Record<string, string | number>;
+type SaveStatus = "idle" | "saving" | "saved" | "error";
 
 export default function Home() {
   const { data: session, status } = useSession();
@@ -40,10 +42,15 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [rowData, setRowData] = useState<RowShape[]>([]);
   const [columnDefs, setColumnDefs] = useState<ColDef[]>([]);
-  const [loaded, setLoaded] = useState(false);
+  const [loadedId, setLoadedId] = useState<string | null>(null);
+  const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
+
+  // 저장 대기열(셀 범위 → 값)과 디바운스 타이머
+  const pendingRef = useRef<Map<string, string>>(new Map());
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const defaultColDef = useMemo<ColDef>(
-    () => ({ resizable: true, sortable: false, minWidth: 90 }),
+    () => ({ resizable: true, sortable: false, minWidth: 90, editable: true }),
     [],
   );
 
@@ -79,6 +86,7 @@ export default function Home() {
           width: 56,
           pinned: "left",
           sortable: false,
+          editable: false,
           cellClass: "ag-row-number",
         },
         ...Array.from({ length: Math.max(maxCols, 1) }, (_, i) => ({
@@ -96,16 +104,61 @@ export default function Home() {
 
       setColumnDefs(cols);
       setRowData(rows);
-      setLoaded(true);
+      setLoadedId(id);
+      setSaveStatus("idle");
     } catch (e) {
       setError(e instanceof Error ? e.message : "알 수 없는 오류가 발생했습니다.");
       setRowData([]);
       setColumnDefs([]);
-      setLoaded(false);
+      setLoadedId(null);
     } finally {
       setLoading(false);
     }
   }, [sheetInput]);
+
+  // 대기열에 쌓인 변경분을 시트에 저장
+  const flushSaves = useCallback(async () => {
+    if (!loadedId) return;
+    const entries = Array.from(pendingRef.current.entries());
+    if (entries.length === 0) return;
+    pendingRef.current.clear();
+
+    setSaveStatus("saving");
+    try {
+      const res = await fetch("/api/sheet", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          spreadsheetId: loadedId,
+          updates: entries.map(([range, value]) => ({ range, value })),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "저장에 실패했습니다.");
+      setSaveStatus("saved");
+    } catch (e) {
+      setSaveStatus("error");
+      setError(e instanceof Error ? e.message : "저장 중 오류가 발생했습니다.");
+    }
+  }, [loadedId]);
+
+  // 셀 편집 → 낙관적 반영(그리드가 즉시 표시) + 디바운스 저장
+  const onCellValueChanged = useCallback(
+    (e: CellValueChangedEvent) => {
+      const field = e.colDef.field;
+      if (!field || field === "__row") return;
+      const row = (e.data as RowShape).__row;
+      const value = e.newValue == null ? "" : String(e.newValue);
+      pendingRef.current.set(`${field}${row}`, value);
+
+      setSaveStatus("saving");
+      if (timerRef.current) clearTimeout(timerRef.current);
+      timerRef.current = setTimeout(() => {
+        void flushSaves();
+      }, 700);
+    },
+    [flushSaves],
+  );
 
   // ---- 세션 로딩 중 ----
   if (status === "loading") {
@@ -141,7 +194,10 @@ export default function Home() {
     <div className="flex flex-1 flex-col">
       {/* 상단 바 */}
       <header className="flex items-center justify-between border-b border-gray-200 bg-white px-6 py-3">
-        <h1 className="text-lg font-bold tracking-tight">Sheet Helper</h1>
+        <div className="flex items-center gap-3">
+          <h1 className="text-lg font-bold tracking-tight">Sheet Helper</h1>
+          <SaveBadge status={saveStatus} />
+        </div>
         <div className="flex items-center gap-3 text-sm">
           <span className="text-gray-500">{session.user?.email}</span>
           <button
@@ -179,14 +235,21 @@ export default function Home() {
 
       {/* 그리드 */}
       <main className="flex-1 p-6">
-        {loaded ? (
-          <div className="h-[calc(100vh-220px)] w-full overflow-hidden rounded-xl ring-1 ring-gray-200">
-            <AgGridReact
-              rowData={rowData}
-              columnDefs={columnDefs}
-              defaultColDef={defaultColDef}
-            />
-          </div>
+        {loadedId ? (
+          <>
+            <p className="mb-2 text-xs text-gray-400">
+              셀을 더블클릭해 수정하면 구글 시트에 자동 저장돼요.
+            </p>
+            <div className="h-[calc(100vh-250px)] w-full overflow-hidden rounded-xl ring-1 ring-gray-200">
+              <AgGridReact
+                rowData={rowData}
+                columnDefs={columnDefs}
+                defaultColDef={defaultColDef}
+                onCellValueChanged={onCellValueChanged}
+                stopEditingWhenCellsLoseFocus
+              />
+            </div>
+          </>
         ) : (
           <div className="flex h-full items-center justify-center text-center text-gray-400">
             <div>
@@ -201,5 +264,20 @@ export default function Home() {
         )}
       </main>
     </div>
+  );
+}
+
+/** 저장 상태 배지 */
+function SaveBadge({ status }: { status: SaveStatus }) {
+  if (status === "idle") return null;
+  const config = {
+    saving: { text: "저장 중…", className: "bg-gray-100 text-gray-500" },
+    saved: { text: "저장됨 ✓", className: "bg-green-50 text-green-600" },
+    error: { text: "저장 실패", className: "bg-red-50 text-red-600" },
+  }[status];
+  return (
+    <span className={`rounded-full px-2.5 py-0.5 text-xs font-medium ${config.className}`}>
+      {config.text}
+    </span>
   );
 }

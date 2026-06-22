@@ -442,7 +442,7 @@ export default function Home() {
             <p className="mb-2 text-xs text-gray-400">
               셀을 더블클릭해 수정하면 자동 저장돼요. 헤더로 정렬·필터할 수 있고, 시트에서 바뀐 내용도 5초 안에 반영됩니다.
             </p>
-            <div className="flex-1 overflow-hidden rounded-xl ring-1 ring-gray-200">
+            <div className="h-[calc(100vh-290px)] w-full overflow-hidden rounded-xl ring-1 ring-gray-200">
               <AgGridReact
                 rowData={rowData}
                 columnDefs={columnDefs}

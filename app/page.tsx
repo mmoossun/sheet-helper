@@ -14,6 +14,23 @@ import {
   type CellEditingStoppedEvent,
   type RowSelectionOptions,
 } from "ag-grid-community";
+import {
+  ResponsiveContainer,
+  BarChart,
+  Bar,
+  LineChart,
+  Line,
+  PieChart,
+  Pie,
+  Cell,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  Legend,
+} from "recharts";
+
+const PIE_COLORS = ["#6366f1", "#22c55e", "#f59e0b", "#ef4444", "#06b6d4", "#a855f7", "#ec4899", "#84cc16"];
 
 // AG Grid v33+ 는 모듈 등록이 필요하다.
 ModuleRegistry.registerModules([AllCommunityModule]);
@@ -106,6 +123,7 @@ export default function Home() {
   const [aiPrompt, setAiPrompt] = useState("");
   const [aiLoading, setAiLoading] = useState(false);
   const [blockOpen, setBlockOpen] = useState(false);
+  const [chartOpen, setChartOpen] = useState(false);
 
   const gridApiRef = useRef<GridApi | null>(null);
   const colCountRef = useRef(0); // 현재 데이터 열 개수(행번호 열 제외)
@@ -610,6 +628,12 @@ export default function Home() {
                   🧱 함수 블록
                 </button>
                 <button
+                  onClick={() => setChartOpen(true)}
+                  className="rounded-lg bg-sky-600 px-3 py-1.5 text-sm font-semibold text-white transition hover:bg-sky-500"
+                >
+                  📊 차트
+                </button>
+                <button
                   onClick={addRow}
                   className="rounded-lg px-3 py-1.5 text-sm text-gray-700 ring-1 ring-gray-200 transition hover:bg-gray-50"
                 >
@@ -725,6 +749,14 @@ export default function Home() {
           </div>
         )}
       </main>
+
+      {chartOpen && loadedId && (
+        <ChartModal
+          rowData={rowData}
+          columnDefs={columnDefs}
+          onClose={() => setChartOpen(false)}
+        />
+      )}
     </div>
   );
 }
@@ -741,5 +773,188 @@ function SaveBadge({ status }: { status: SaveStatus }) {
     <span className={`rounded-full px-2.5 py-0.5 text-xs font-medium ${config.className}`}>
       {config.text}
     </span>
+  );
+}
+
+/** 차트 / 대시보드 모달 — 현재 탭 데이터를 읽어 KPI + 차트로 시각화 */
+function ChartModal({
+  rowData,
+  columnDefs,
+  onClose,
+}: {
+  rowData: RowShape[];
+  columnDefs: ColDef[];
+  onClose: () => void;
+}) {
+  const dataCols = useMemo(
+    () =>
+      columnDefs
+        .map((c) => c.field)
+        .filter((f): f is string => !!f && f !== "__row"),
+    [columnDefs],
+  );
+  const headerRow = useMemo(() => rowData.find((r) => r.__row === 1), [rowData]);
+  const headerLabel = (col: string) => {
+    const h = headerRow?.[col];
+    return h !== undefined && String(h).trim() !== "" ? `${col} · ${h}` : col;
+  };
+
+  const [chartType, setChartType] = useState<"bar" | "line" | "pie">("bar");
+  const [labelCol, setLabelCol] = useState(dataCols[0] ?? "A");
+  const [valueCol, setValueCol] = useState(dataCols[1] ?? dataCols[0] ?? "B");
+
+  const chartData = useMemo(() => {
+    return rowData
+      .filter((r) => r.__row !== 1) // 1행은 머리글로 간주
+      .map((r) => {
+        const raw = r[valueCol];
+        const value =
+          typeof raw === "number" ? raw : parseFloat(String(raw ?? "").replace(/,/g, ""));
+        return { name: String(r[labelCol] ?? ""), value };
+      })
+      .filter((d) => Number.isFinite(d.value));
+  }, [rowData, labelCol, valueCol]);
+
+  const kpis = useMemo(() => {
+    const vals = chartData.map((d) => d.value);
+    const count = vals.length;
+    const sum = vals.reduce((a, b) => a + b, 0);
+    return {
+      sum,
+      count,
+      avg: count ? sum / count : 0,
+      max: count ? Math.max(...vals) : 0,
+      min: count ? Math.min(...vals) : 0,
+    };
+  }, [chartData]);
+
+  const fmt = (n: number) =>
+    n.toLocaleString("ko-KR", { maximumFractionDigits: 1 });
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="max-h-[90vh] w-full max-w-3xl overflow-auto rounded-2xl bg-white p-6 shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mb-4 flex items-center justify-between">
+          <h2 className="text-lg font-bold tracking-tight">차트 / 대시보드</h2>
+          <button
+            onClick={onClose}
+            className="rounded-lg px-3 py-1.5 text-sm text-gray-600 ring-1 ring-gray-200 transition hover:bg-gray-50"
+          >
+            닫기
+          </button>
+        </div>
+
+        {/* 설정 */}
+        <div className="mb-4 flex flex-wrap items-end gap-3">
+          <div className="flex gap-1">
+            {(["bar", "line", "pie"] as const).map((t) => (
+              <button
+                key={t}
+                onClick={() => setChartType(t)}
+                className={`rounded-lg px-3 py-1.5 text-sm transition ${
+                  chartType === t
+                    ? "bg-gray-900 font-semibold text-white"
+                    : "text-gray-600 ring-1 ring-gray-200 hover:bg-gray-50"
+                }`}
+              >
+                {t === "bar" ? "막대" : t === "line" ? "선" : "원형"}
+              </button>
+            ))}
+          </div>
+          <label className="text-xs text-gray-500">
+            라벨(가로)
+            <select
+              value={labelCol}
+              onChange={(e) => setLabelCol(e.target.value)}
+              className="ml-1 rounded-lg border border-gray-300 px-2 py-1 text-sm text-gray-900"
+            >
+              {dataCols.map((c) => (
+                <option key={c} value={c}>
+                  {headerLabel(c)}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="text-xs text-gray-500">
+            값(세로)
+            <select
+              value={valueCol}
+              onChange={(e) => setValueCol(e.target.value)}
+              className="ml-1 rounded-lg border border-gray-300 px-2 py-1 text-sm text-gray-900"
+            >
+              {dataCols.map((c) => (
+                <option key={c} value={c}>
+                  {headerLabel(c)}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+
+        {chartData.length === 0 ? (
+          <p className="py-12 text-center text-sm text-gray-400">
+            선택한 값 열에 숫자 데이터가 없어요. 1행은 머리글로 간주하고, 2행부터 숫자 값을
+            읽어요.
+          </p>
+        ) : (
+          <>
+            {/* KPI 카드 */}
+            <div className="mb-4 grid grid-cols-2 gap-2 sm:grid-cols-5">
+              {[
+                { label: "합계", value: fmt(kpis.sum) },
+                { label: "평균", value: fmt(kpis.avg) },
+                { label: "개수", value: fmt(kpis.count) },
+                { label: "최댓값", value: fmt(kpis.max) },
+                { label: "최솟값", value: fmt(kpis.min) },
+              ].map((k) => (
+                <div key={k.label} className="rounded-xl bg-gray-50 p-3 text-center">
+                  <div className="text-xs text-gray-500">{k.label}</div>
+                  <div className="mt-0.5 text-lg font-bold text-gray-900">{k.value}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* 차트 */}
+            <div className="h-80 w-full">
+              <ResponsiveContainer width="100%" height="100%">
+                {chartType === "bar" ? (
+                  <BarChart data={chartData}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#eee" />
+                    <XAxis dataKey="name" tick={{ fontSize: 12 }} />
+                    <YAxis tick={{ fontSize: 12 }} />
+                    <Tooltip />
+                    <Bar dataKey="value" fill="#6366f1" radius={[4, 4, 0, 0]} />
+                  </BarChart>
+                ) : chartType === "line" ? (
+                  <LineChart data={chartData}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#eee" />
+                    <XAxis dataKey="name" tick={{ fontSize: 12 }} />
+                    <YAxis tick={{ fontSize: 12 }} />
+                    <Tooltip />
+                    <Line type="monotone" dataKey="value" stroke="#6366f1" strokeWidth={2} />
+                  </LineChart>
+                ) : (
+                  <PieChart>
+                    <Tooltip />
+                    <Legend />
+                    <Pie data={chartData} dataKey="value" nameKey="name" outerRadius={110} label>
+                      {chartData.map((_, i) => (
+                        <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />
+                      ))}
+                    </Pie>
+                  </PieChart>
+                )}
+              </ResponsiveContainer>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
   );
 }

@@ -32,6 +32,15 @@ import {
 
 const PIE_COLORS = ["#6366f1", "#22c55e", "#f59e0b", "#ef4444", "#06b6d4", "#a855f7", "#ec4899", "#84cc16"];
 
+type Agg = "sum" | "avg" | "count" | "max" | "min";
+const AGG_OPTIONS: { key: Agg; label: string }[] = [
+  { key: "sum", label: "합계" },
+  { key: "avg", label: "평균" },
+  { key: "count", label: "개수" },
+  { key: "max", label: "최댓값" },
+  { key: "min", label: "최솟값" },
+];
+
 // AG Grid v33+ 는 모듈 등록이 필요하다.
 ModuleRegistry.registerModules([AllCommunityModule]);
 
@@ -800,36 +809,60 @@ function ChartModal({
   };
 
   const [chartType, setChartType] = useState<"bar" | "line" | "pie">("bar");
-  const [labelCol, setLabelCol] = useState(dataCols[0] ?? "A");
+  const [groupCol, setGroupCol] = useState(dataCols[0] ?? "A");
   const [valueCol, setValueCol] = useState(dataCols[1] ?? dataCols[0] ?? "B");
+  const [agg, setAgg] = useState<Agg>("sum");
 
+  const aggLabel = AGG_OPTIONS.find((o) => o.key === agg)?.label ?? "";
+  const fmt = (n: number) => n.toLocaleString("ko-KR", { maximumFractionDigits: 1 });
+
+  // 그룹 기준 열로 묶어서 값 열을 집계 → 의미 있는 요약 차트
   const chartData = useMemo(() => {
-    return rowData
-      .filter((r) => r.__row !== 1) // 1행은 머리글로 간주
-      .map((r) => {
-        const raw = r[valueCol];
-        const value =
-          typeof raw === "number" ? raw : parseFloat(String(raw ?? "").replace(/,/g, ""));
-        return { name: String(r[labelCol] ?? ""), value };
+    const parseNum = (raw: string | number | undefined) =>
+      typeof raw === "number" ? raw : parseFloat(String(raw ?? "").replace(/,/g, ""));
+    const map = new Map<string, { sum: number; count: number; max: number; min: number }>();
+    for (const r of rowData) {
+      if (r.__row === 1) continue; // 1행은 머리글
+      const key = String(r[groupCol] ?? "").trim() || "(빈값)";
+      let acc = map.get(key);
+      if (!acc) {
+        acc = { sum: 0, count: 0, max: -Infinity, min: Infinity };
+        map.set(key, acc);
+      }
+      if (agg === "count") {
+        acc.count += 1;
+      } else {
+        const v = parseNum(r[valueCol]);
+        if (!Number.isFinite(v)) continue;
+        acc.sum += v;
+        acc.count += 1;
+        acc.max = Math.max(acc.max, v);
+        acc.min = Math.min(acc.min, v);
+      }
+    }
+    const arr = [...map.entries()]
+      .map(([name, a]) => {
+        let value: number;
+        if (agg === "count") value = a.count;
+        else if (agg === "sum") value = a.sum;
+        else if (agg === "avg") value = a.count ? a.sum / a.count : 0;
+        else if (agg === "max") value = a.count ? a.max : 0;
+        else value = a.count ? a.min : 0;
+        return { name, value };
       })
-      .filter((d) => Number.isFinite(d.value));
-  }, [rowData, labelCol, valueCol]);
+      .filter((d) => (agg === "count" ? d.value > 0 : Number.isFinite(d.value)));
+    if (chartType !== "line") arr.sort((x, y) => y.value - x.value); // 값 큰 순(랭킹)
+    return arr.slice(0, 30);
+  }, [rowData, groupCol, valueCol, agg, chartType]);
 
   const kpis = useMemo(() => {
+    if (chartData.length === 0) return null;
     const vals = chartData.map((d) => d.value);
-    const count = vals.length;
     const sum = vals.reduce((a, b) => a + b, 0);
-    return {
-      sum,
-      count,
-      avg: count ? sum / count : 0,
-      max: count ? Math.max(...vals) : 0,
-      min: count ? Math.min(...vals) : 0,
-    };
+    const count = vals.length;
+    const sorted = [...chartData].sort((a, b) => b.value - a.value);
+    return { count, sum, avg: sum / count, top: sorted[0], bottom: sorted[sorted.length - 1] };
   }, [chartData]);
-
-  const fmt = (n: number) =>
-    n.toLocaleString("ko-KR", { maximumFractionDigits: 1 });
 
   return (
     <div
@@ -868,10 +901,10 @@ function ChartModal({
             ))}
           </div>
           <label className="text-xs text-gray-500">
-            라벨(가로)
+            그룹 기준
             <select
-              value={labelCol}
-              onChange={(e) => setLabelCol(e.target.value)}
+              value={groupCol}
+              onChange={(e) => setGroupCol(e.target.value)}
               className="ml-1 rounded-lg border border-gray-300 px-2 py-1 text-sm text-gray-900"
             >
               {dataCols.map((c) => (
@@ -882,11 +915,26 @@ function ChartModal({
             </select>
           </label>
           <label className="text-xs text-gray-500">
-            값(세로)
+            집계
+            <select
+              value={agg}
+              onChange={(e) => setAgg(e.target.value as Agg)}
+              className="ml-1 rounded-lg border border-gray-300 px-2 py-1 text-sm text-gray-900"
+            >
+              {AGG_OPTIONS.map((o) => (
+                <option key={o.key} value={o.key}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className={`text-xs ${agg === "count" ? "text-gray-300" : "text-gray-500"}`}>
+            값
             <select
               value={valueCol}
               onChange={(e) => setValueCol(e.target.value)}
-              className="ml-1 rounded-lg border border-gray-300 px-2 py-1 text-sm text-gray-900"
+              disabled={agg === "count"}
+              className="ml-1 rounded-lg border border-gray-300 px-2 py-1 text-sm text-gray-900 disabled:bg-gray-100 disabled:text-gray-400"
             >
               {dataCols.map((c) => (
                 <option key={c} value={c}>
@@ -897,28 +945,36 @@ function ChartModal({
           </label>
         </div>
 
+        <p className="mb-3 text-xs text-gray-500">
+          「{headerLabel(groupCol)}」별{" "}
+          {agg === "count" ? "개수" : `「${headerLabel(valueCol)}」 ${aggLabel}`}
+        </p>
+
         {chartData.length === 0 ? (
           <p className="py-12 text-center text-sm text-gray-400">
-            선택한 값 열에 숫자 데이터가 없어요. 1행은 머리글로 간주하고, 2행부터 숫자 값을
-            읽어요.
+            표시할 데이터가 없어요. 그룹 기준·집계·값을 확인해 주세요. (1행은 머리글, 2행부터
+            데이터로 읽어요.)
           </p>
         ) : (
           <>
-            {/* KPI 카드 */}
-            <div className="mb-4 grid grid-cols-2 gap-2 sm:grid-cols-5">
-              {[
-                { label: "합계", value: fmt(kpis.sum) },
-                { label: "평균", value: fmt(kpis.avg) },
-                { label: "개수", value: fmt(kpis.count) },
-                { label: "최댓값", value: fmt(kpis.max) },
-                { label: "최솟값", value: fmt(kpis.min) },
-              ].map((k) => (
-                <div key={k.label} className="rounded-xl bg-gray-50 p-3 text-center">
-                  <div className="text-xs text-gray-500">{k.label}</div>
-                  <div className="mt-0.5 text-lg font-bold text-gray-900">{k.value}</div>
-                </div>
-              ))}
-            </div>
+            {/* KPI 카드 (그룹 집계 기준) */}
+            {kpis && (
+              <div className="mb-4 grid grid-cols-2 gap-2 sm:grid-cols-5">
+                {[
+                  { label: "그룹 수", value: fmt(kpis.count), sub: "" },
+                  { label: "합계", value: fmt(kpis.sum), sub: "" },
+                  { label: "평균", value: fmt(kpis.avg), sub: "" },
+                  { label: "최대", value: fmt(kpis.top.value), sub: kpis.top.name },
+                  { label: "최소", value: fmt(kpis.bottom.value), sub: kpis.bottom.name },
+                ].map((k) => (
+                  <div key={k.label} className="rounded-xl bg-gray-50 p-3 text-center">
+                    <div className="text-xs text-gray-500">{k.label}</div>
+                    <div className="mt-0.5 text-lg font-bold text-gray-900">{k.value}</div>
+                    {k.sub && <div className="truncate text-[11px] text-gray-400">{k.sub}</div>}
+                  </div>
+                ))}
+              </div>
+            )}
 
             {/* 차트 */}
             <div className="h-80 w-full">
